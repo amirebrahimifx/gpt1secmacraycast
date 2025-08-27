@@ -1,0 +1,102 @@
+#!/bin/zsh
+# Required parameters:
+# @raycast.schemaVersion 1
+# @raycast.title Quick Ask: Text + Image
+# @raycast.mode silent
+# @raycast.packageName ChatGPT Tools
+# Optional parameters:
+# @raycast.icon 💭
+# @raycast.needsConfirmation false
+# @raycast.author Amir
+# @raycast.description Capture the topmost real window to clipboard, then open ChatGPT Quick Ask, paste image and helper text.
+
+set -u
+
+# --- 0) Capture current clipboard text (excerpt) before we overwrite it with an image ---
+EXCERPT="$(pbpaste 2>/dev/null || true)"
+# Trim to ~800 bytes (simple/truncation; fine for most ASCII/UTF-8)
+EXCERPT="${EXCERPT:0:800}"
+
+# --- 1) Try to get the topmost *real* window’s CGWindowID (skip overlays like Raycast/ChatGPT Mini) ---
+WIN_ID="$(
+osascript -l JavaScript <<'JXA'
+ObjC.import('CoreGraphics');
+function run() {
+  var opts = $.kCGWindowListOptionOnScreenOnly | $.kCGWindowListExcludeDesktopElements;
+  var list = ObjC.unwrap($.CGWindowListCopyWindowInfo(opts, $.kCGNullWindowID));
+  var skip = {'ChatGPT':1,'Shortcuts':1,'Shortcuts Events':1,'Raycast':1,'Spotlight':1,'Control Center':1,'Notification Center':1,'Dock':1};
+  for (var i = 0; i < list.length; i++) {
+    var w = list[i];
+    var owner = String(w.kCGWindowOwnerName || '');
+    if (skip[owner]) continue;
+    var layer = Number(w.kCGWindowLayer || 0);
+    if (layer > 30) continue;
+    var b = w.kCGWindowBounds || {};
+    var width  = Number(b.Width  || 0), height = Number(b.Height || 0);
+    if (width < 30 || height < 30) continue;
+    var alpha = Number(w.kCGWindowAlpha); if (alpha === 0) continue;
+    return String(w.kCGWindowNumber);
+  }
+  return "";
+}
+JXA
+)"
+
+# --- 2) Capture: prefer window-ID; on failure, fall back to interactive window; then selection ---
+CAP_OK=0
+if [[ -n "$WIN_ID" ]]; then
+  /usr/sbin/screencapture -c -o -l "$WIN_ID" 2>/dev/null && CAP_OK=1
+fi
+if [[ $CAP_OK -eq 0 ]]; then
+  /usr/sbin/screencapture -c -o -w 2>/dev/null && CAP_OK=1
+fi
+if [[ $CAP_OK -eq 0 ]]; then
+  /usr/sbin/screencapture -c -o -i 2>/dev/null && CAP_OK=1
+fi
+
+# --- 3) Build final helper text (keep your original wording) ---
+if [[ -n "$EXCERPT" ]]; then
+  FINAL_TEXT=$'from my clipboard:\n-----\n'"$EXCERPT"$'\n-----\n'"please respond in short. this part that you can see being pasted here the \"the thing that from my clipboard if I have provided you with otherwise you can find it on image\" is the one the person asking wants to know either its meaning both in this concept of the image that you can see and also he wants to know the overall meaning of that. so also if applicable give that person some pro tips about things that you can see. please make your response short."
+else
+  FINAL_TEXT=$'please respond in short. this part that you can see being pasted here the \"the thing that from my clipboard if I have provided you with otherwise you can find it on image\" is the one the person asking wants to know either its meaning both in this concept of the image that you can see and also he wants to know the overall meaning of that. so also if applicable give that person some pro tips about things that you can see. please make your response short.'
+fi
+
+# --- 4) Open ChatGPT Quick Ask on the current Space and focus its input (no app activation jump) ---
+osascript <<'OSA' 2>/dev/null
+tell application "System Events" to keystroke space using {option down} -- toggle Quick Ask (⌥Space)
+delay 0.35
+tell application "System Events"
+  try
+    if exists process "ChatGPT" then
+      tell process "ChatGPT"
+        if exists window 1 then
+          tell window 1
+            if exists text area 1 then
+              set focused of text area 1 to true
+            else if exists scroll area 1 then
+              tell scroll area 1
+                if exists text area 1 then set focused of text area 1 to true
+              end tell
+            end if
+          end tell
+        end if
+      end tell
+    end if
+  end try
+end tell
+OSA
+
+# --- 5) Paste image, then paste text ---
+# (Image is already on clipboard from screencapture)
+osascript -e 'tell application "System Events" to keystroke "v" using {command down}' >/dev/null 2>&1
+sleep 0.25
+
+# Put our helper text on the clipboard and paste it
+print -r -- "$FINAL_TEXT" | pbcopy
+osascript -e 'tell application "System Events" to keystroke "v" using {command down}' >/dev/null 2>&1
+
+# Optional: auto-send (uncomment next line if you want that)
+# osascript -e 'tell application "System Events" to key code 36' >/dev/null 2>&1  # Return
+
+# --- 6) Clear clipboard after a few seconds so you don't keep a giant PNG around ---
+( sleep 5; pbcopy < /dev/null ) >/dev/null 2>&1 &
