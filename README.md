@@ -1,4 +1,4 @@
-#gpt1secmacraycast
+# gpt1secmacraycast
 
 A lightweight tool that lets you ask ChatGPT quick questions from a small window—anywhere on your Mac. It’s designed to let you provide maximum context in your prompt effortlessly.
 
