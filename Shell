@@ -1,102 +1,324 @@
-#!/bin/zsh
-# Required parameters:
-# @raycast.schemaVersion 1
-# @raycast.title Quick Ask: Text + Image
-# @raycast.mode silent
-# @raycast.packageName ChatGPT Tools
-# Optional parameters:
-# @raycast.icon 💭
-# @raycast.needsConfirmation false
-# @raycast.author Amir
-# @raycast.description Capture the topmost real window to clipboard, then open ChatGPT Quick Ask, paste image and helper text.
+use AppleScript version "2.8"
+use framework "Foundation"
+use framework "AppKit"
+use scripting additions
 
-set -u
+-- ======= BEHAVIOR TOGGLES =======
+property autoSend : false -- press Return after pasting?
+property twoPasteMode : true -- paste image first, then text (more reliable)
+property includeExcerpt : true -- include text already on clipboard
+property maxExcerptChars : 800
+property autoClearSeconds : 5 -- 0 = no auto-clear
+property requireInputFile : true -- if true, demand a file/alias/path/NSURL; don't try exotic Shortcuts objects
+property allowClipboardFallback : false -- if true, fall back to clipboard image when no valid input provided
 
-# --- 0) Capture current clipboard text (excerpt) before we overwrite it with an image ---
-EXCERPT="$(pbpaste 2>/dev/null || true)"
-# Trim to ~800 bytes (simple/truncation; fine for most ASCII/UTF-8)
-EXCERPT="${EXCERPT:0:800}"
+-- ========= MAIN =========
+on run {input, parameters}
+	try
+		-- 1) Build the prompt text from existing clipboard excerpt
+		set excerptText to my readClipboardText()
+		set finalText to my buildFinalText(excerptText)
+		
+		-- 2) Resolve PNG bytes from the input (file/URL/alias/path/NSData/NSImage)
+		set pngData to my pngDataFromShortcutInput(input)
+		if pngData is missing value then error "No valid image passed (and clipboard fallback disabled)."
+		
+		-- 3) UI: open Quick Ask and focus input (your part that already worked)
+		set gotFocus to false
+		with timeout of 6 seconds
+			my toggleQuickAsk()
+			delay 0.35
+			set gotFocus to my focusQuickAskNoActivate()
+		end timeout
+		if gotFocus is false then
+			tell application "System Events" to key code 48 -- Tab
+			delay 0.05
+		end if
+		
+		-- 4) Paste
+		if twoPasteMode then
+			my writePNGOnlyToClipboard(pngData)
+			tell application "System Events" to keystroke "v" using {command down}
+			delay 0.25
+			my writePlainTextOnlyToClipboard(finalText)
+			tell application "System Events"
+				keystroke "v" using {command down}
+				if autoSend then keystroke return
+			end tell
+		else
+			-- Mixed paste needs an NSImage object; construct it from PNG bytes safely.
+			set imageObj to my nsImageFromPNGData(pngData)
+			if imageObj is missing value then error "Could not construct NSImage from PNG data."
+			my writeImageAndTextOneItem(imageObj, finalText)
+			tell application "System Events"
+				keystroke "v" using {command down}
+				if autoSend then keystroke return
+			end tell
+			set imageObj to missing value
+		end if
+		
+	on error e number n
+		if autoClearSeconds > 0 then my delayedClearClipboard(autoClearSeconds)
+		if n is -128 then return -- user canceled
+		display alert "Error " & n message e as warning
+	end try
+	
+	if autoClearSeconds > 0 then my delayedClearClipboard(autoClearSeconds)
+end run
 
-# --- 1) Try to get the topmost *real* window’s CGWindowID (skip overlays like Raycast/ChatGPT Mini) ---
-WIN_ID="$(
-osascript -l JavaScript <<'JXA'
-ObjC.import('CoreGraphics');
-function run() {
-  var opts = $.kCGWindowListOptionOnScreenOnly | $.kCGWindowListExcludeDesktopElements;
-  var list = ObjC.unwrap($.CGWindowListCopyWindowInfo(opts, $.kCGNullWindowID));
-  var skip = {'ChatGPT':1,'Shortcuts':1,'Shortcuts Events':1,'Raycast':1,'Spotlight':1,'Control Center':1,'Notification Center':1,'Dock':1};
-  for (var i = 0; i < list.length; i++) {
-    var w = list[i];
-    var owner = String(w.kCGWindowOwnerName || '');
-    if (skip[owner]) continue;
-    var layer = Number(w.kCGWindowLayer || 0);
-    if (layer > 30) continue;
-    var b = w.kCGWindowBounds || {};
-    var width  = Number(b.Width  || 0), height = Number(b.Height || 0);
-    if (width < 30 || height < 30) continue;
-    var alpha = Number(w.kCGWindowAlpha); if (alpha === 0) continue;
-    return String(w.kCGWindowNumber);
-  }
-  return "";
-}
-JXA
-)"
+-- ========= INPUT NORMALIZATION (NO -1728) =========
+on pngDataFromShortcutInput(inputVal)
+	set NSData to current application's NSData
+	set NSImage to current application's NSImage
+	set NSURL to current application's NSURL
+	set NSBitmapImageRep to current application's NSBitmapImageRep
+	set NSDictionary to current application's NSDictionary
+	set FM to current application's NSFileManager's defaultManager()
+	
+	-- Normalize Shortcuts input (often a single-item list)
+	set obj to inputVal
+	if obj is missing value then set obj to {}
+	if class of obj is list then
+		if (count of obj) > 0 then
+			set obj to item 1 of obj
+		else
+			set obj to missing value
+		end if
+	end if
+	
+	-- If we require a file-like input, try path/alias/NSURL first and skip exotic objects.
+	if requireInputFile then
+		set {pngData, ok} to my pngFromFileish(obj)
+		if ok then return pngData
+		if allowClipboardFallback then
+			set {pbPNG, _img} to my pngDataFromClipboardImage()
+			return pbPNG
+		end if
+		return missing value
+	end if
+	
+	-- Otherwise be generous: try ObjC types, then file-ish, then clipboard if allowed.
+	-- === ObjC NSImage / NSData / NSURL (each probe wrapped) ===
+	set imageObj to missing value
+	if obj is not missing value then
+		-- NSImage
+		try
+			if (obj's isKindOfClass:(NSImage)) as boolean then set imageObj to obj
+		end try
+		-- NSData -> NSImage
+		if imageObj is missing value then
+			try
+				if (obj's isKindOfClass:(NSData)) as boolean then set imageObj to (NSImage's alloc()'s initWithData:obj)
+			end try
+		end if
+		-- NSURL (file) -> NSData -> NSImage
+		if imageObj is missing value then
+			try
+				if (obj's isKindOfClass:(NSURL)) as boolean then
+					set d to NSData's dataWithContentsOfURL:obj
+					if d ≠ missing value then set imageObj to (NSImage's alloc()'s initWithData:d)
+				end if
+			end try
+		end if
+	end if
+	
+	-- Path/alias text
+	if imageObj is missing value then
+		set {pngFromFile, ok} to my pngFromFileish(obj)
+		if ok then return pngFromFile
+	end if
+	
+	-- Clipboard fallback
+	if allowClipboardFallback then
+		set {pbPNG, _img} to my pngDataFromClipboardImage()
+		return pbPNG
+	end if
+	
+	-- If we got an NSImage from ObjC probes, convert it to PNG
+	if imageObj is not missing value then
+		set tiffData to missing value
+		try
+			set tiffData to imageObj's TIFFRepresentation()
+		end try
+		if tiffData = missing value then return missing value
+		set rep to NSBitmapImageRep's imageRepWithData:tiffData
+		if rep = missing value then return missing value
+		set emptyDict to NSDictionary's dictionary()
+		set pngData to rep's representationUsingType:(current application's NSBitmapImageFileTypePNG) |properties|:emptyDict
+		return pngData
+	end if
+	
+	return missing value
+end pngDataFromShortcutInput
 
-# --- 2) Capture: prefer window-ID; on failure, fall back to interactive window; then selection ---
-CAP_OK=0
-if [[ -n "$WIN_ID" ]]; then
-  /usr/sbin/screencapture -c -o -l "$WIN_ID" 2>/dev/null && CAP_OK=1
-fi
-if [[ $CAP_OK -eq 0 ]]; then
-  /usr/sbin/screencapture -c -o -w 2>/dev/null && CAP_OK=1
-fi
-if [[ $CAP_OK -eq 0 ]]; then
-  /usr/sbin/screencapture -c -o -i 2>/dev/null && CAP_OK=1
-fi
+-- File-like to PNG helper: accepts alias / POSIX path text / NSURL(file)
+on pngFromFileish(obj)
+	set NSData to current application's NSData
+	set NSImage to current application's NSImage
+	set NSBitmapImageRep to current application's NSBitmapImageRep
+	set NSDictionary to current application's NSDictionary
+	set NSURL to current application's NSURL
+	set FM to current application's NSFileManager's defaultManager()
+	
+	set p to missing value
+	set dataObj to missing value
+	set img to missing value
+	
+	-- NSURL(file)
+	try
+		if obj is not missing value then
+			if (obj's isKindOfClass:(NSURL)) as boolean then
+				set dataObj to NSData's dataWithContentsOfURL:obj
+			end if
+		end if
+	end try
+	
+	-- alias / POSIX path text
+	if dataObj is missing value then
+		try
+			if class of obj is alias then
+				set p to POSIX path of obj
+			else if class of obj is text then
+				set p to obj
+			end if
+		end try
+		if p is not missing value then
+			set existsRef to reference
+			set existsInfo to FM's fileExistsAtPath:p isDirectory:existsRef
+			if (item 1 of existsInfo) as boolean then
+				set dataObj to NSData's dataWithContentsOfFile:p
+			end if
+		end if
+	end if
+	
+	if dataObj is missing value then return {missing value, false}
+	
+	set img to (current application's NSImage's alloc()'s initWithData:dataObj)
+	if img = missing value then return {missing value, false}
+	
+	set tiffData to img's TIFFRepresentation()
+	if tiffData = missing value then return {missing value, false}
+	set rep to NSBitmapImageRep's imageRepWithData:tiffData
+	if rep = missing value then return {missing value, false}
+	set emptyDict to NSDictionary's dictionary()
+	set pngData to rep's representationUsingType:(current application's NSBitmapImageFileTypePNG) |properties|:emptyDict
+	if pngData = missing value then return {missing value, false}
+	return {pngData, true}
+end pngFromFileish
 
-# --- 3) Build final helper text (keep your original wording) ---
-if [[ -n "$EXCERPT" ]]; then
-  FINAL_TEXT=$'from my clipboard:\n-----\n'"$EXCERPT"$'\n-----\n'"please respond in short. this part that you can see being pasted here the \"the thing that from my clipboard if I have provided you with otherwise you can find it on image\" is the one the person asking wants to know either its meaning both in this concept of the image that you can see and also he wants to know the overall meaning of that. so also if applicable give that person some pro tips about things that you can see. please make your response short."
-else
-  FINAL_TEXT=$'please respond in short. this part that you can see being pasted here the \"the thing that from my clipboard if I have provided you with otherwise you can find it on image\" is the one the person asking wants to know either its meaning both in this concept of the image that you can see and also he wants to know the overall meaning of that. so also if applicable give that person some pro tips about things that you can see. please make your response short.'
-fi
+-- Build NSImage safely from PNG bytes only when needed (mixed paste)
+on nsImageFromPNGData(pngData)
+	try
+		return (current application's NSImage's alloc()'s initWithData:pngData)
+	end try
+	return missing value
+end nsImageFromPNGData
 
-# --- 4) Open ChatGPT Quick Ask on the current Space and focus its input (no app activation jump) ---
-osascript <<'OSA' 2>/dev/null
-tell application "System Events" to keystroke space using {option down} -- toggle Quick Ask (⌥Space)
-delay 0.35
-tell application "System Events"
-  try
-    if exists process "ChatGPT" then
-      tell process "ChatGPT"
-        if exists window 1 then
-          tell window 1
-            if exists text area 1 then
-              set focused of text area 1 to true
-            else if exists scroll area 1 then
-              tell scroll area 1
-                if exists text area 1 then set focused of text area 1 to true
-              end tell
-            end if
-          end tell
-        end if
-      end tell
-    end if
-  end try
-end tell
-OSA
+-- ========= CLIPBOARD + UI HELPERS =========
+on readClipboardText()
+	set pb to current application's NSPasteboard's generalPasteboard()
+	set s to pb's stringForType:"public.utf8-plain-text"
+	if s = missing value then return ""
+	return (s as text)
+end readClipboardText
 
-# --- 5) Paste image, then paste text ---
-# (Image is already on clipboard from screencapture)
-osascript -e 'tell application "System Events" to keystroke "v" using {command down}' >/dev/null 2>&1
-sleep 0.25
+on pngDataFromClipboardImage()
+	set pb to current application's NSPasteboard's generalPasteboard()
+	set theImage to (current application's NSImage's alloc()'s initWithPasteboard:pb)
+	if theImage = missing value then return {missing value, missing value}
+	try
+		if ((theImage's isValid()) as boolean) is false then return {missing value, missing value}
+	end try
+	set tiffData to theImage's TIFFRepresentation()
+	if tiffData = missing value then return {missing value, missing value}
+	set rep to (current application's NSBitmapImageRep's imageRepWithData:tiffData)
+	if rep = missing value then return {missing value, missing value}
+	set emptyDict to current application's NSDictionary's dictionary()
+	set pngData to rep's representationUsingType:(current application's NSBitmapImageFileTypePNG) |properties|:emptyDict
+	return {pngData, theImage}
+end pngDataFromClipboardImage
 
-# Put our helper text on the clipboard and paste it
-print -r -- "$FINAL_TEXT" | pbcopy
-osascript -e 'tell application "System Events" to keystroke "v" using {command down}' >/dev/null 2>&1
+on writePNGOnlyToClipboard(pngData)
+	set pb to current application's NSPasteboard's generalPasteboard()
+	set pbItem to (current application's NSPasteboardItem's alloc()'s init())
+	pbItem's setData:pngData forType:"public.png"
+	pb's clearContents()
+	pb's writeObjects:(current application's NSArray's arrayWithObject:pbItem)
+end writePNGOnlyToClipboard
 
-# Optional: auto-send (uncomment next line if you want that)
-# osascript -e 'tell application "System Events" to key code 36' >/dev/null 2>&1  # Return
+on writePlainTextOnlyToClipboard(theText)
+	set pb to current application's NSPasteboard's generalPasteboard()
+	pb's clearContents()
+	set nsText to (current application's NSString's stringWithString:theText)
+	pb's setString:nsText forType:"public.utf8-plain-text"
+end writePlainTextOnlyToClipboard
 
-# --- 6) Clear clipboard after a few seconds so you don't keep a giant PNG around ---
-( sleep 5; pbcopy < /dev/null ) >/dev/null 2>&1 &
+on writeImageAndTextOneItem(theImage, theText)
+	set pb to current application's NSPasteboard's generalPasteboard()
+	set tiffData to theImage's TIFFRepresentation()
+	set pbItem to (current application's NSPasteboardItem's alloc()'s init())
+	pbItem's setData:tiffData forType:"public.tiff"
+	set rep to (current application's NSBitmapImageRep's imageRepWithData:tiffData)
+	if rep is not missing value then
+		set pngData to rep's representationUsingType:(current application's NSBitmapImageFileTypePNG) |properties|:(current application's NSDictionary's dictionary())
+		if pngData is not missing value then pbItem's setData:pngData forType:"public.png"
+	end if
+	set nsText to (current application's NSString's stringWithString:theText)
+	pbItem's setString:nsText forType:"public.utf8-plain-text"
+	pb's clearContents()
+	pb's writeObjects:(current application's NSArray's arrayWithObject:pbItem)
+end writeImageAndTextOneItem
+
+on buildFinalText(ex)
+	set lf to linefeed
+	set base to ""
+	if includeExcerpt and ex is not "" then
+		set exTrim to my trimExcerpt(ex, maxExcerptChars)
+		set base to "from my clipboard:" & lf & "-----" & lf & exTrim & lf & "-----" & lf
+	end if
+	set instructionText to "please respond in short. this part that you can see being pasted here the " & quote & "the thing that from my clipboard if I have provided you with otherwise you can find it on image" & quote & " is the one the person asking wants to know either its meaning both in this concept of the image that you can see and also he wants to know the overall meaning of that. so also if applicable give that person some pro tips about things that you can see. please make your response short."
+	return base & instructionText
+end buildFinalText
+
+on trimExcerpt(t, maxLen)
+	if (length of t) ≤ maxLen then return t
+	return (text 1 thru maxLen of t) & "..."
+end trimExcerpt
+
+on toggleQuickAsk()
+	tell application "System Events" to keystroke space using {option down}
+end toggleQuickAsk
+
+on focusQuickAskNoActivate()
+	tell application "System Events"
+		if not (exists process "ChatGPT") then return false
+		tell process "ChatGPT"
+			try
+				if (exists window 1) then
+					tell window 1
+						if (exists text area 1) then
+							set focused of text area 1 to true
+							return true
+						else if (exists scroll area 1) then
+							tell scroll area 1
+								if (exists text area 1) then
+									set focused of text area 1 to true
+									return true
+								end if
+							end tell
+						end if
+					end tell
+				end if
+			end try
+		end tell
+	end tell
+	return false
+end focusQuickAskNoActivate
+
+on delayedClearClipboard(sec)
+	try
+		delay sec
+		set pb to current application's NSPasteboard's generalPasteboard()
+		pb's clearContents()
+	end try
+end delayedClearClipboard
