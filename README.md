@@ -6,6 +6,7 @@ A lightweight tool that lets you ask ChatGPT quick questions from a small window
 
 
 Setup Instructions
+
 	1.	Create a Shortcut in Apple Shortcuts.
  
 	2.	Add these two actions to the shortcut:
